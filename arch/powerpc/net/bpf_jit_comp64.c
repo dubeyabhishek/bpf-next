@@ -171,9 +171,25 @@ void bpf_jit_realloc_regs(struct codegen_context *ctx)
 {
 }
 
-void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
+static void emit_percpu_ptr(u32 *image, struct codegen_context *ctx, void __percpu *ptr)
 {
-	int i;
+	EMIT(PPC_RAW_LI(bpf_to_ppc(BPF_REG_6), (u64)ptr));
+}
+
+void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx, struct bpf_prog *fp)
+{
+	int i, stack_depth;
+	void __percpu *priv_stack_ptr = NULL;
+	void __percpu *priv_frame_ptr = NULL;
+
+	stack_depth = fp->aux->stack_depth;
+	if (ctx->priv_sp_used)
+		priv_stack_ptr = fp->aux->priv_stack_ptr;
+	if (priv_stack_ptr) {
+		priv_frame_ptr = priv_stack_ptr + PRIV_STACK_GUARD_SZ
+						+ round_up(stack_depth, 16);
+		stack_depth = 0;
+	};
 
 	/* Instruction for trampoline attach */
 	EMIT(PPC_RAW_NOP());
@@ -263,6 +279,11 @@ void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
 		 */
 		EMIT(PPC_RAW_MR(_R1, _R5));
         }
+
+	if (ctx->priv_sp_used) {
+		/* Set up private stack pointer */
+		emit_percpu_ptr(image, ctx, priv_frame_ptr);
+	}
 
 	if (ctx->arena_vm_start)
 		PPC_LI64(bpf_to_ppc(ARENA_VM_START), ctx->arena_vm_start);
@@ -821,6 +842,18 @@ int bpf_jit_build_body(struct bpf_prog *fp, u32 *image, u32 *fimage, struct code
 			bpf_set_seen_register(ctx, dst_reg);
 		if (src_reg >= BPF_PPC_NVR_MIN && src_reg < 32)
 			bpf_set_seen_register(ctx, src_reg);
+
+		/*
+		 * Re-map BPF_REG_FP with BPF_REG_6, so that private stack
+		 * is used in place of conventional stack frame.
+		 */
+		if (fp->aux->priv_stack_ptr) {
+			if (src_reg == BPF_REG_FP)
+				src_reg = BPF_REG_6;
+
+			if (dst_reg == BPF_REG_FP)
+				dst_reg = BPF_REG_6;
+		}
 
 		switch (code) {
 		/*
