@@ -68,28 +68,40 @@ void bpf_jit_build_fentry_stubs(u32 *image, struct codegen_context *ctx)
 	WARN_ON_ONCE(!is_offset_in_branch_range(4 - (long)ctx->idx * 4));
 	EMIT(PPC_RAW_BRANCH(4 - (long)ctx->idx * 4));
 
+	/* pre-stub NOP for further stub alignment */
+	if (ctx->idx & 1)
+		EMIT(PPC_RAW_NOP());
+
 	/*
 	 * Long branch stub:
-	 *	.long	<dummy_tramp_addr>
 	 *	mflr	r11
 	 *	bcl	20,31,$+4
-	 *	mflr	r12
-	 *	ld	r12, -8-SZL(r12)
+	 *	mflr	r12		// lr/r12 stores current pc
+	 *	ld	r12, 24(r12)	// offset(dummy_tramp_addr) from prev inst. is 24
 	 *	mtctr	r12
-	 *	mtlr	r11 // needed to retain ftrace ABI
+	 *	mtlr	r11		// needed to retain ftrace ABI
 	 *	bctr
+	 *	nop			// For mem alignment of dummy_tramp_addr
+	 *	.long	<dummy_tramp_addr>
 	 */
-	if (image)
-		*((unsigned long *)&image[ctx->idx]) = (unsigned long)dummy_tramp;
-	ctx->idx += SZL / 4;
 	long_branch_stub_idx = ctx->idx;
 	EMIT(PPC_RAW_MFLR(_R11));
 	EMIT(PPC_RAW_BCL4());
 	EMIT(PPC_RAW_MFLR(_R12));
-	EMIT(PPC_RAW_LL(_R12, _R12, -8-SZL));
+	EMIT(PPC_RAW_LL(_R12, _R12, 24));
 	EMIT(PPC_RAW_MTCTR(_R12));
 	EMIT(PPC_RAW_MTLR(_R11));
 	EMIT(PPC_RAW_BCTR());
+	/*
+	 * Mandatory NOP padding, aligning next field dummy_tramp with
+	 * 8-byte boundary
+	 */
+	EMIT(PPC_RAW_NOP());
+
+	if (image)
+		*((unsigned long *)&image[ctx->idx]) = (unsigned long)dummy_tramp;
+
+	ctx->idx += SZL / 4;
 
 	if (!bpf_jit_ool_stub) {
 		bpf_jit_ool_stub = (ctx->idx - ool_stub_idx) * 4;
@@ -316,7 +328,16 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
 	proglen = cgctx.idx * 4;
 	alloclen = proglen + FUNCTION_DESCR_SIZE + fixup_len + extable_len;
 
-	fhdr = bpf_jit_binary_pack_alloc(alloclen, &fimage, 4, &hdr, &image,
+	/*
+	 * Ensuring 8-byte alignment for fimage buffer, so that 8-byte alignment
+	 * of long_tramp_addr field in long_branch_stub can be ensured only with
+	 * even/odd value of ctx->idx.
+	 *
+	 * Note: Do not change alignment value until we support trampolines on
+	 * power P9 and earlier processors. P10 onwards, 8-byte memory alignment
+	 * requirement is relaxed.
+	 */
+	fhdr = bpf_jit_binary_pack_alloc(alloclen, &fimage, 8, &hdr, &image,
 					      bpf_jit_fill_ill_insns);
 	if (!fhdr) {
 		fp = org_fp;
@@ -1223,16 +1244,18 @@ static void do_isync(void *info __maybe_unused)
  *	[b|bl]	<bpf_prog>/<long_branch_stub>
  *	mtlr	r0 // CONFIG_PPC_FTRACE_OUT_OF_LINE only
  *	b	bpf_func + 4
+ *	nop     // optinonal, pre-NOP for 8-byte alignment of next stub
  * 3. Long branch stub:
  * long_branch_stub:
- *	.long	<branch_addr>/<dummy_tramp>
  *	mflr	r11
  *	bcl	20,31,$+4
  *	mflr	r12
- *	ld	r12, -16(r12)
+ *	ld	r12, 24(r12)
  *	mtctr	r12
  *	mtlr	r11 // needed to retain ftrace ABI
  *	bctr
+ *	nop     // 8th inst of 4 byte, making next slot 8 byte aligned
+ *	.long	<branch_addr>/<dummy_tramp>
  *
  * dummy_tramp is used to reduce synchronization requirements.
  *
@@ -1300,8 +1323,19 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type old_t,
 
 	bpf_func_end = bpf_func + size;
 
+	/* Compute location of ool_stub & lb_stub from prog end */
+	u32 *lb_stub_start = (u32 *)(bpf_func_end - bpf_jit_long_branch_stub);
+	/*
+	 * The optional pre-NOP before lb_stub makes things tricky when computing
+	 * start of ool_stub. The pre-NOP can be located just before lb_stub as
+	 * ool_stub always ends with branch and not NOP.
+	 */
+	bool has_pre_nop = (*(lb_stub_start - 1) == PPC_RAW_NOP());
+	void *ool_stub_start = (void *)lb_stub_start - (has_pre_nop ? 4 : 0)
+				- bpf_jit_ool_stub;
+
 	/* Address of the jmp/call instruction in the out-of-line stub */
-	ip = (void *)(bpf_func_end - bpf_jit_ool_stub + 4);
+	ip = (void *)(ool_stub_start + 4);
 
 	if (!is_offset_in_branch_range((long)ip - 4 - bpf_func)) {
 		pr_err("%s (0x%lx): bpf prog too large, ool stub out of branch range\n", __func__,
@@ -1334,10 +1368,12 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type old_t,
 	 * 1. Update the address in the long branch stub:
 	 * If new_addr is out of range, we will have to use the long branch stub, so patch new_addr
 	 * here. Otherwise, revert to dummy_tramp, but only if we had patched old_addr here.
+	 *
+	 * dummy_tramp_addr moved to bottom of long branch stub.
 	 */
 	if ((new_addr && !is_offset_in_branch_range(new_addr - ip)) ||
 	    (old_addr && !is_offset_in_branch_range(old_addr - ip)))
-		ret = patch_ulong((void *)(bpf_func_end - bpf_jit_long_branch_stub - SZL),
+		ret = patch_ulong((void *)(bpf_func_end - SZL), /* SZL: dummy_tramp_addr offset */
 				  (new_addr && !is_offset_in_branch_range(new_addr - ip)) ?
 				  (unsigned long)new_addr : (unsigned long)dummy_tramp);
 	if (ret)
@@ -1353,10 +1389,10 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type old_t,
 	if (!old_addr || !new_addr) {
 		if (!old_addr) {
 			old_inst = ppc_inst(PPC_RAW_NOP());
-			create_branch(&new_inst, ip, bpf_func_end - bpf_jit_ool_stub, 0);
+			create_branch(&new_inst, ip, (unsigned long)ool_stub_start, 0);
 		} else {
 			new_inst = ppc_inst(PPC_RAW_NOP());
-			create_branch(&old_inst, ip, bpf_func_end - bpf_jit_ool_stub, 0);
+			create_branch(&old_inst, ip, (unsigned long)ool_stub_start, 0);
 		}
 		ret = bpf_modify_inst(ip, old_inst, new_inst);
 	}
