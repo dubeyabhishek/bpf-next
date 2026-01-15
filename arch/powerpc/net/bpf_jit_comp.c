@@ -394,6 +394,16 @@ skip_init_ctx:
 			goto out_addrs;
 		}
 		bpf_prog_fill_jited_linfo(fp, addrs);
+		/*
+		 * On ABI V1, executable code starts after the function
+		 * descriptor, so adjust base accordingly.
+		 */
+#ifdef CONFIG_PPC64_ELF_ABI_V1
+		bpf_prog_update_insn_ptrs(fp, addrs,
+				(void *)fimage + FUNCTION_DESCR_SIZE);
+#else
+		bpf_prog_update_insn_ptrs(fp, addrs, fimage);
+#endif
 out_addrs:
 		if (!image && priv_stack_ptr) {
 			fp->aux->priv_stack_ptr = NULL;
