@@ -285,6 +285,11 @@ _GLOBAL(ftrace_caller)
 _GLOBAL(ftrace_stub)
 	blr
 
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+_GLOBAL(ftrace_stub_graph)
+	blr
+#endif
+
 #ifdef CONFIG_PPC64
 ftrace_no_trace:
 #ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
