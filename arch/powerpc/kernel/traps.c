@@ -38,6 +38,7 @@
 #include <linux/console.h>
 #include <linux/kmsg_dump.h>
 #include <linux/debugfs.h>
+#include <linux/cfi.h>
 
 #include <asm/emulated_ops.h>
 #include <linux/uaccess.h>
@@ -1475,6 +1476,64 @@ static int emulate_math(struct pt_regs *regs)
 static inline int emulate_math(struct pt_regs *regs) { return -1; }
 #endif
 
+#ifdef CONFIG_CFI
+static bool kcfi_handler(struct pt_regs *regs)
+{
+	if (user_mode(regs))
+		return false;
+
+	/*
+	 * kCFI pattern on PowerPC:
+	 *   lwz r3, -4(r3)      # Load actual hash from function-4
+	 *   lis r4, <high>      # Load expected hash high bits
+	 *   ori r4, r4, <low>   # Load expected hash low bits
+	 *   cmpw r3, r4         # Compare hashes (32-bit)
+	 *   beq .Lskip          # Skip to callee fn, if match
+	 *   trap                # CFI violation trigger
+	 */
+	unsigned long addr = regs->nip;
+	u32 insn;
+	u32 actual_hash = (u32)regs->gpr[3];
+	u32 expected_hash = (u32)regs->gpr[4];
+	unsigned long target = regs->gpr[12];
+
+	/*
+	 * Read the instruction at the fault,
+	 * must be kernel address.
+	 */
+	if (get_kernel_nofault(insn, (void *)addr))
+		return false;
+
+	/* Retrieved instruction must be trap for CFI */
+	if (insn != PPC_RAW_TRAP())
+		return false;
+
+	pr_err("CFI failure: 0x%lx actual: 0x%08x expected: 0x%08x\n",
+		addr, actual_hash, expected_hash);
+
+	/* Call the generic CFI failure reporter */
+	switch (report_cfi_failure(regs, addr, &target, expected_hash)) {
+	case BUG_TRAP_TYPE_WARN:
+		/* For warning skip trap and continue */
+		regs->nip += 4;
+		break;
+
+	case BUG_TRAP_TYPE_BUG:
+		die("Oops - CFI", regs, 0);
+
+	default:
+		return false;
+	}
+
+	return true;
+}
+#else
+static inline bool kcfi_handler(struct pt_regs *regs)
+{
+	return false;
+}
+#endif /* CONFIG_CFI */
+
 static void do_program_check(struct pt_regs *regs)
 {
 	unsigned int reason = get_reason(regs);
@@ -1495,6 +1554,9 @@ static void do_program_check(struct pt_regs *regs)
 			return;
 
 		if (kprobe_handler(regs))
+			return;
+
+		if (kcfi_handler(regs))
 			return;
 
 		/* trap exception */
