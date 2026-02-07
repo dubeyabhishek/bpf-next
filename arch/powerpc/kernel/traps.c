@@ -1546,7 +1546,8 @@ static void do_program_check(struct pt_regs *regs)
 		parse_fpe(regs);
 		return;
 	}
-	if (reason & REASON_TRAP) {
+	if (reason & REASON_TRAP && !user_mode(regs)) {
+		/* Trap from userspace handled later, eg CFI trap */
 		unsigned long bugaddr;
 		/* Debugger is first in line to stop recursive faults in
 		 * rcu_lock, notify_die, or atomic_notifier_call_chain */
@@ -1571,17 +1572,14 @@ static void do_program_check(struct pt_regs *regs)
 		if (!is_kernel_addr(bugaddr) && !(regs->msr & MSR_IR))
 			bugaddr += PAGE_OFFSET;
 
-		if (!user_mode(regs) &&
-		    report_bug(bugaddr, regs) == BUG_TRAP_TYPE_WARN) {
+		if (report_bug(bugaddr, regs) == BUG_TRAP_TYPE_WARN) {
 			regs_add_return_ip(regs, 4);
 			return;
 		}
 
 		/* User mode considers other cases after enabling IRQs */
-		if (!user_mode(regs)) {
-			_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
-			return;
-		}
+		_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
+		return;
 	}
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
 	if (reason & REASON_TM) {
@@ -1633,9 +1631,23 @@ static void do_program_check(struct pt_regs *regs)
 	 * was a hashchk failure.
 	 */
 	if (reason & REASON_TRAP) {
-		if (cpu_has_feature(CPU_FTR_DEXCR_NPHIE)) {
-			ppc_inst_t insn;
+		ppc_inst_t insn;
 
+		if (!get_user_instr(insn, (void __user *)regs->nip)) {
+			/*
+			 * CFI violations invoke TRAP from kernel/userspace
+			 * For kernel violations we have kcfi_handle.
+			 */
+			if (IS_ENABLED(CONFIG_CFI) && ppc_inst_val(insn) == PPC_RAW_TRAP() &&
+				is_cfi_trap(regs)) {
+				pr_err_ratelimited("CFI failure: userspace %s[%d] at 0x%lx\n",
+				current->comm, current->pid, regs->nip);
+				pr_err_ratelimited("expected: 0x%08x, actual: 0x%08x\n",
+				(u32)regs->gpr[3], (u32)regs->gpr[4]);
+			}
+		}
+
+		if (cpu_has_feature(CPU_FTR_DEXCR_NPHIE)) {
 			if (get_user_instr(insn, (void __user *)regs->nip)) {
 				_exception(SIGSEGV, regs, SEGV_MAPERR, regs->nip);
 				return;
