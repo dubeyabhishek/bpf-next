@@ -20,10 +20,10 @@
 #define IS_TWI(instr)		(((instr) & 0xfc000000) == 0x0c000000)
 
 #ifdef CONFIG_PPC64
-#define is_trap(instr)		(IS_TW(instr) || IS_TD(instr) || \
+#define is_ppc_trap(instr)	(IS_TW(instr) || IS_TD(instr) || \
 				IS_TWI(instr) || IS_TDI(instr))
 #else
-#define is_trap(instr)		(IS_TW(instr) || IS_TWI(instr))
+#define is_ppc_trap(instr)	(IS_TW(instr) || IS_TWI(instr))
 #endif /* CONFIG_PPC64 */
 
 #ifdef CONFIG_PPC_ADV_DEBUG_REGS

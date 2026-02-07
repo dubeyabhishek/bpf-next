@@ -301,7 +301,7 @@ int kprobe_handler(struct pt_regs *regs)
 			 * instruction. If the current instruction is a
 			 * trap variant, it could belong to someone else
 			 */
-			if (is_trap(instr))
+			if (is_ppc_trap(instr))
 				goto no_kprobe;
 			/*
 			 * The breakpoint instruction was removed right
@@ -319,7 +319,7 @@ int kprobe_handler(struct pt_regs *regs)
 	/* Check we're not actually recursing */
 	if (kprobe_running()) {
 		kprobe_opcode_t insn = *p->ainsn.insn;
-		if (kcb->kprobe_status == KPROBE_HIT_SS && is_trap(insn)) {
+		if (kcb->kprobe_status == KPROBE_HIT_SS && is_ppc_trap(insn)) {
 			/* Turn off 'trace' bits */
 			regs_set_return_msr(regs,
 				(regs->msr & ~MSR_SINGLESTEP) |

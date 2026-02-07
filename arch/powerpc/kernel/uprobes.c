@@ -25,7 +25,7 @@
  */
 bool is_trap_insn(uprobe_opcode_t *insn)
 {
-	return (is_trap(*insn));
+	return (is_ppc_trap(*insn));
 }
 
 /**
