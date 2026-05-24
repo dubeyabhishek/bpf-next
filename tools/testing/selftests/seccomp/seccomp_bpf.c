@@ -171,9 +171,11 @@ struct seccomp_data {
 #endif
 
 #ifndef __NR_uprobe
-# if defined(__x86_64__)
-#  define __NR_uprobe 336
-# endif
+#  ifdef __x86_64__
+#    define __NR_uprobe 336
+#  elif defined(__powerpc64__)
+#    define __NR_uprobe 472
+#  endif
 #endif
 
 #ifndef SECCOMP_SET_MODE_STRICT
@@ -5048,25 +5050,34 @@ TEST(tsync_vs_dead_thread_leader)
  * check to skip possible endbr64 instruction and ignoring
  * -Wattributes, otherwise the compilation might fail.
  */
+#ifdef __x86_64__
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
 
 __naked __nocf_check noinline int probed_uprobe(void)
 {
-	/*
-	 * Optimized uprobe is possible only on top of nop5 instruction.
-	 */
-	asm volatile ("                                 \n"
-		".byte 0x0f, 0x1f, 0x44, 0x00, 0x00     \n"
-		"ret                                    \n"
-	);
+    asm volatile (
+        ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n"
+        "ret\n"
+    );
 }
 #pragma GCC diagnostic pop
 
-#else
+#elif defined(__powerpc64__)
+
+__naked noinline int probed_uprobe(void)
+{
+    asm volatile (
+        "nop\n"     /* 4-byte powerpc NOP = USDT probe site */
+        "blr\n"
+    );
+}
+
+#else  /* all other architectures */
 noinline int probed_uprobe(void)
 {
-	return 1;
+    return 1;
 }
 #endif
 

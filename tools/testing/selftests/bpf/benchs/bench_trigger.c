@@ -408,6 +408,26 @@ static void *uprobe_producer_nop5(void *input)
 	return NULL;
 }
 
+#elif defined(__powerpc64__)
+/*
+ * On powerpc64le there is no 5-byte NOP.  The standard 4-byte NOP
+ * (0x60000000) is the USDT optimization target — it is the instruction
+ * the optimization replaces with a bl to the trampoline, playing the
+ * same role that the 5-byte NOP plays on x86.
+ */
+__weak void uprobe_target_nop5(void)
+{
+    asm volatile ("nop");
+}
+
+static void *uprobe_producer_nop5(void *input)
+{
+    while (true)
+        uprobe_target_nop5();
+    return NULL;
+}
+#endif
+
 void usdt_1(void);
 void usdt_2(void);
 
@@ -424,7 +444,6 @@ static void *uprobe_producer_usdt_nop5(void *input)
 		usdt_2();
 	return NULL;
 }
-#endif
 
 static void usetup(bool use_retprobe, bool use_multi, void *target_addr)
 {
@@ -541,7 +560,7 @@ static void uretprobe_multi_ret_setup(void)
 	usetup(true, true /* use_multi */, &uprobe_target_ret);
 }
 
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__powerpc64__)
 static void uprobe_nop5_setup(void)
 {
 	usetup(false, false /* !use_multi */, &uprobe_target_nop5);
@@ -664,7 +683,7 @@ BENCH_TRIG_USERMODE(uprobe_multi_ret, ret, "uprobe-multi-ret");
 BENCH_TRIG_USERMODE(uretprobe_multi_nop, nop, "uretprobe-multi-nop");
 BENCH_TRIG_USERMODE(uretprobe_multi_push, push, "uretprobe-multi-push");
 BENCH_TRIG_USERMODE(uretprobe_multi_ret, ret, "uretprobe-multi-ret");
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__powerpc64__)
 BENCH_TRIG_USERMODE(uprobe_nop5, nop5, "uprobe-nop5");
 BENCH_TRIG_USERMODE(uretprobe_nop5, nop5, "uretprobe-nop5");
 BENCH_TRIG_USERMODE(uprobe_multi_nop5, nop5, "uprobe-multi-nop5");

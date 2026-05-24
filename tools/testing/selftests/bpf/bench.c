@@ -538,7 +538,7 @@ extern const struct bench bench_trig_uprobe_multi_push;
 extern const struct bench bench_trig_uretprobe_multi_push;
 extern const struct bench bench_trig_uprobe_multi_ret;
 extern const struct bench bench_trig_uretprobe_multi_ret;
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__powerpc64__)
 extern const struct bench bench_trig_uprobe_nop5;
 extern const struct bench bench_trig_uretprobe_nop5;
 extern const struct bench bench_trig_uprobe_multi_nop5;
@@ -618,7 +618,7 @@ static const struct bench *benchs[] = {
 	&bench_trig_uretprobe_multi_push,
 	&bench_trig_uprobe_multi_ret,
 	&bench_trig_uretprobe_multi_ret,
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__powerpc64__)	
 	&bench_trig_uprobe_nop5,
 	&bench_trig_uretprobe_nop5,
 	&bench_trig_uprobe_multi_nop5,

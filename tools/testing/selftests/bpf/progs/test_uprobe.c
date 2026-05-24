@@ -96,4 +96,34 @@ int BPF_UPROBE(test_regs_change_ip)
 	ctx->ip = ip;
 	return 0;
 }
+
+#elif defined(__TARGET_ARCH_powerpc)
+struct pt_regs regs;
+SEC("uprobe")
+int BPF_UPROBE(test_regs_change)
+{
+        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+        if (pid != my_pid)
+                return 0;
+        ctx->gpr[3]  = regs.gpr[3];   /* r3:  1st arg  (≈ rdi) */
+        ctx->gpr[4]  = regs.gpr[4];   /* r4:  2nd arg  (≈ rsi) */
+        ctx->gpr[5]  = regs.gpr[5];   /* r5:  3rd arg  (≈ rdx) */
+        ctx->gpr[6]  = regs.gpr[6];   /* r6:  4th arg  (≈ rcx) */
+        ctx->gpr[7]  = regs.gpr[7];   /* r7:  5th arg  (≈ r8)  */
+        ctx->gpr[8]  = regs.gpr[8];   /* r8:  6th arg  (≈ r9)  */
+        ctx->gpr[9]  = regs.gpr[9];   /* r9:  7th arg  (≈ r10) */
+        ctx->gpr[10] = regs.gpr[10];  /* r10: 8th arg  (≈ r11) */
+        return 0;
+}
+
+unsigned long ip;
+SEC("uprobe")
+int BPF_UPROBE(test_regs_change_ip)
+{
+        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+        if (pid != my_pid)
+                return 0;
+        ctx->nip = ip;   /* nip: Next Instruction Pointer (≈ rip) */
+        return 0;
+}
 #endif

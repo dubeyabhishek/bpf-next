@@ -599,8 +599,9 @@ static struct bin_attribute bin_attr_bpf_testmod_file __ro_after_init = {
 /* bpf_testmod_uprobe sysfs attribute is so far enabled for x86_64 only,
  * please see test_uretprobe_regs_change test
  */
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__powerpc64__)
 
+#ifdef __x86_64__
 static int
 uprobe_handler(struct uprobe_consumer *self, struct pt_regs *regs, __u64 *data)
 {
@@ -610,13 +611,36 @@ uprobe_handler(struct uprobe_consumer *self, struct pt_regs *regs, __u64 *data)
 
 static int
 uprobe_ret_handler(struct uprobe_consumer *self, unsigned long func,
-		   struct pt_regs *regs, __u64 *data)
-
+                   struct pt_regs *regs, __u64 *data)
 {
-	regs->ax  = 0x12345678deadbeef;
-	regs->r11 = (u64) -1;
-	return 0;
+        /* rax is the return-value register; r11 is caller-saved. */
+        regs->ax  = 0x12345678deadbeef;
+        regs->r11 = (u64) -1;
+        return 0;
 }
+
+#elif defined(__powerpc64__)
+static int
+uprobe_handler(struct uprobe_consumer *self, struct pt_regs *regs, __u64 *data)
+{
+        /* r4 is caller-saved on powerpc64le ELFv2, equivalent of x86 rcx.
+         * Modifying it proves entry-handler changes reach userspace. */
+        regs->gpr[4] = 0x87654321feebdaed;
+        return 0;
+}
+
+static int
+uprobe_ret_handler(struct uprobe_consumer *self, unsigned long func,
+                   struct pt_regs *regs, __u64 *data)
+{
+        /* r3 is the return-value register on powerpc64le, equivalent of
+         * x86 rax.  r12 is caller-saved volatile (used by the linker for
+         * long branch stubs), equivalent of x86 r11. */
+        regs->gpr[3]  = 0x12345678deadbeef;
+        regs->gpr[12] = (u64) -1;
+        return 0;
+}
+#endif
 
 struct testmod_uprobe {
 	struct path path;
