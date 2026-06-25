@@ -18,6 +18,132 @@
 
 #define UPROBE_TRAP_NR	UINT_MAX
 
+#ifdef CONFIG_PPC64
+
+static int tramp_mremap(const struct vm_special_mapping *sm,
+                        struct vm_area_struct *new_vma)
+{
+    return -EPERM;
+}
+
+static struct page *tramp_mapping_pages[2] __ro_after_init;
+
+static struct vm_special_mapping tramp_mapping = {
+    .name   = "[uprobes-trampoline]",
+    .mremap = tramp_mremap,
+    .pages  = tramp_mapping_pages,
+};
+
+struct uprobe_trampoline {
+    struct hlist_node   node;
+    unsigned long       vaddr;   /* user-space address of the mapped page */
+};
+
+/*
+ * Trampoline stack frame (offsets from r1 after stdu r1,-128(r1)):
+ *   0: back chain, 8: LR (=probe_addr+4), 16: CR, 24-96: r3-r12
+ */
+#define UPROBE_TRAMP_FRAME_SIZE    128
+#define UPROBE_TRAMP_LR_OFFSET       8
+#define UPROBE_TRAMP_CR_OFFSET      16
+#define UPROBE_TRAMP_GPR3_OFFSET    24
+
+static bool is_reachable_by_bl(unsigned long vtramp, unsigned long vaddr)
+{
+    long delta = (long)(vtramp - vaddr);
+
+    /* bl: 26-bit signed byte offset, range -(1<<25) to +(1<<25)-4 */
+    return delta >= -(1L << 25) && delta <= ((1L << 25) - 4) &&
+           !(delta & 3);
+}
+
+static unsigned long find_nearest_trampoline(unsigned long vaddr)
+{
+    struct vm_unmapped_area_info info = {
+        .length     = PAGE_SIZE,
+        .align_mask = ~PAGE_MASK,
+        .low_limit  = max(PAGE_SIZE,  vaddr - (1UL << 25)),
+        .high_limit = min(TASK_SIZE,  vaddr + (1UL << 25)),
+    };
+
+    return vm_unmapped_area(&info);
+}
+
+static struct uprobe_trampoline *create_uprobe_trampoline(unsigned long vaddr)
+{
+    struct mm_struct *mm = current->mm;
+    struct uprobe_trampoline *tramp;
+    struct vm_area_struct *vma;
+
+    vaddr = find_nearest_trampoline(vaddr);
+    if (IS_ERR_VALUE(vaddr))
+        return NULL;
+
+    tramp = kzalloc(sizeof(*tramp), GFP_KERNEL);
+    if (unlikely(!tramp))
+        return NULL;
+
+    tramp->vaddr = vaddr;
+    vma = _install_special_mapping(mm, tramp->vaddr, PAGE_SIZE,
+            VM_READ | VM_EXEC | VM_MAYEXEC | VM_MAYREAD |
+            VM_DONTCOPY | VM_IO,
+            &tramp_mapping);
+    if (IS_ERR(vma)) {
+        kfree(tramp);
+        return NULL;
+    }
+    return tramp;
+}
+
+static struct uprobe_trampoline *get_uprobe_trampoline(unsigned long vaddr,
+                                                        bool *new)
+{
+    struct uprobes_state *state = &current->mm->uprobes_state;
+    struct uprobe_trampoline *tramp;
+
+    if (vaddr > TASK_SIZE || vaddr < PAGE_SIZE)
+        return NULL;
+
+    hlist_for_each_entry(tramp, &state->head_tramps, node) {
+        if (is_reachable_by_bl(tramp->vaddr, vaddr)) {
+            *new = false;
+            return tramp;
+        }
+    }
+
+    tramp = create_uprobe_trampoline(vaddr);
+    if (!tramp)
+        return NULL;
+
+    *new = true;
+    hlist_add_head(&tramp->node, &state->head_tramps);
+    return tramp;
+}
+
+static void destroy_uprobe_trampoline(struct uprobe_trampoline *tramp)
+{
+    /* VMA left mapped; all mappings share one .rodata page */
+    hlist_del(&tramp->node);
+    kfree(tramp);
+}
+
+void arch_uprobe_init_state(struct mm_struct *mm)
+{
+    INIT_HLIST_HEAD(&mm->uprobes_state.head_tramps);
+}
+
+void arch_uprobe_clear_state(struct mm_struct *mm)
+{
+    struct uprobes_state *state = &mm->uprobes_state;
+    struct uprobe_trampoline *tramp;
+    struct hlist_node *n;
+
+    hlist_for_each_entry_safe(tramp, n, &state->head_tramps, node)
+        destroy_uprobe_trampoline(tramp);
+}
+
+#endif /* CONFIG_PPC64 */
+
 /**
  * is_trap_insn - check if the instruction is a trap variant
  * @insn: instruction to be checked.

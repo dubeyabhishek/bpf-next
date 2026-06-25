@@ -186,7 +186,7 @@ struct xol_area;
 
 struct uprobes_state {
 	struct xol_area		*xol_area;
-#ifdef CONFIG_X86_64
+#if defined(CONFIG_X86_64) || defined(CONFIG_PPC64)
 	struct hlist_head	head_tramps;
 #endif
 };
