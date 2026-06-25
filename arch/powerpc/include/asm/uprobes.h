@@ -21,11 +21,21 @@ typedef u32 uprobe_opcode_t;
 #define UPROBE_SWBP_INSN	BREAKPOINT_INSTRUCTION
 #define UPROBE_SWBP_INSN_SIZE	4 /* swbp insn size in bytes */
 
+#ifdef CONFIG_PPC64
+enum {
+	ARCH_UPROBE_FLAG_CAN_OPTIMIZE   = 0,
+	ARCH_UPROBE_FLAG_OPTIMIZE_FAIL  = 1,
+};
+#endif
+
 struct arch_uprobe {
 	union {
-		u32 insn[2];
+		u32 insn[MAX_UINSN_BYTES / sizeof(u32)];
 		u32 ixol[2];
 	};
+#ifdef CONFIG_PPC64
+	unsigned long flags;
+#endif
 };
 
 struct arch_uprobe_task {

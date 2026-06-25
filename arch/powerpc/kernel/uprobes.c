@@ -16,6 +16,7 @@
 
 #include <asm/sstep.h>
 #include <asm/inst.h>
+#include <asm/ppc-opcode.h>
 
 #define UPROBE_TRAP_NR	UINT_MAX
 
@@ -264,6 +265,216 @@ sigill:
     return -1;
 }
 
+static bool is_bl_insn(u32 insn)
+{
+    /* opcode=18, AA=bit[1]=0, LK=bit[0]=1 */
+    return (insn >> 26) == 18 && (insn & 3) == 1;
+}
+
+static unsigned long bl_target(unsigned long pc, u32 insn)
+{
+    /* 26-bit signed byte offset in bits[25:2]; bit 25 is sign bit */
+    s32 offset = (s32)(insn & 0x03FFFFFC);
+
+    if (offset & 0x02000000)
+        offset |= (s32)0xFC000000;
+    return pc + (long)offset;
+}
+
+static u32 make_bl(unsigned long from, unsigned long to)
+{
+    long delta = (long)(to - from);
+
+    /* opcode=18, offset in bits[25:2], AA=0, LK=1 */
+    return (18 << 26) | ((u32)(delta & 0x03FFFFFC)) | 1;
+}
+
+static int copy_from_vaddr(struct mm_struct *mm, unsigned long vaddr,
+                           void *dst, int len)
+{
+    unsigned int gup_flags = FOLL_FORCE | FOLL_SPLIT_PMD;
+    struct vm_area_struct *vma;
+    struct page *page;
+
+    page = get_user_page_vma_remote(mm, vaddr, gup_flags, &vma);
+    if (IS_ERR(page))
+        return PTR_ERR(page);
+    uprobe_copy_from_page(page, vaddr, dst, len);
+    put_page(page);
+    return 0;
+}
+
+enum {
+    OPT_BL,      /* installing bl   — current insn must be trap (swbp) */
+    UNOPT_TRAP,  /* restoring trap  — current insn must be bl           */
+};
+
+struct write_opcode_ctx {
+    unsigned long base;
+    int           update;
+};
+
+static int verify_insn(struct page *page, unsigned long vaddr,
+                       uprobe_opcode_t *new_opcode, int nbytes, void *data)
+{
+    struct write_opcode_ctx *ctx = data;
+    u32 current_insn;
+
+    uprobe_copy_from_page(page, ctx->base, &current_insn, sizeof(u32));
+
+    switch (ctx->update) {
+    case OPT_BL:
+        return is_swbp_insn((uprobe_opcode_t *)&current_insn) ? 1 : -1;
+    case UNOPT_TRAP:
+        return is_bl_insn(current_insn) ? 1 : -1;
+    }
+    return -1;
+}
+
+static int write_insn(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
+                      unsigned long vaddr, uprobe_opcode_t *insn, int nbytes,
+                      void *ctx)
+{
+    return uprobe_write(auprobe, vma, vaddr, insn, nbytes,
+                        verify_insn,
+                        true  /* is_register     */,
+                        false /* do_update_ref_ctr */,
+                        ctx);
+}
+
+static int swbp_optimize(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
+                         unsigned long vaddr, unsigned long tramp_vaddr)
+{
+    struct write_opcode_ctx ctx = { .base = vaddr, .update = OPT_BL };
+    u32 bl_insn = make_bl(vaddr, tramp_vaddr);
+
+    /* trap and bl are both 4-byte aligned on powerpc; one write suffices */
+    return write_insn(auprobe, vma, vaddr,
+                      (uprobe_opcode_t *)&bl_insn, sizeof(u32), &ctx);
+}
+
+static int swbp_unoptimize(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
+                           unsigned long vaddr)
+{
+    struct write_opcode_ctx ctx = { .base = vaddr, .update = UNOPT_TRAP };
+    uprobe_opcode_t trap = UPROBE_SWBP_INSN;
+
+    return write_insn(auprobe, vma, vaddr, &trap, sizeof(u32), &ctx);
+}
+
+static bool can_optimize(struct arch_uprobe *auprobe, unsigned long vaddr)
+{
+    /* Only optimize probes on the 4-byte NOP (0x60000000) USDT marker */
+    return *(u32 *)auprobe->insn == PPC_RAW_NOP() && !(vaddr & 3);
+}
+
+static bool should_optimize(struct arch_uprobe *auprobe)
+{
+    return !test_bit(ARCH_UPROBE_FLAG_OPTIMIZE_FAIL, &auprobe->flags) &&
+            test_bit(ARCH_UPROBE_FLAG_CAN_OPTIMIZE,  &auprobe->flags);
+}
+
+static bool __is_optimized(u32 insn, unsigned long vaddr)
+{
+    if (!is_bl_insn(insn))
+        return false;
+    return __in_uprobe_trampoline(bl_target(vaddr, insn));
+}
+
+static int is_optimized(struct mm_struct *mm, unsigned long vaddr, bool *optimized)
+{
+    u32 insn;
+    int err;
+
+    err = copy_from_vaddr(mm, vaddr, &insn, sizeof(u32));
+    if (err)
+        return err;
+    *optimized = __is_optimized(insn, vaddr);
+    return 0;
+}
+
+/* set_swbp/set_orig_insn: skip redundant writes when probe is optimized */
+int set_swbp(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
+             unsigned long vaddr)
+{
+    if (should_optimize(auprobe)) {
+        bool optimized = false;
+        int  err;
+
+        err = is_optimized(vma->vm_mm, vaddr, &optimized);
+        if (err)
+            return err;
+        if (optimized)
+            return 0;
+    }
+    return uprobe_write_opcode(auprobe, vma, vaddr,
+                               UPROBE_SWBP_INSN, true /* is_register */);
+}
+
+int set_orig_insn(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
+                  unsigned long vaddr)
+{
+    if (test_bit(ARCH_UPROBE_FLAG_CAN_OPTIMIZE, &auprobe->flags)) {
+        struct mm_struct *mm = vma->vm_mm;
+        bool optimized = false;
+        int  err;
+
+        err = is_optimized(mm, vaddr, &optimized);
+        if (err)
+            return err;
+        if (optimized)
+            WARN_ON_ONCE(swbp_unoptimize(auprobe, vma, vaddr));
+    }
+    return uprobe_write_opcode(auprobe, vma, vaddr,
+                               *(uprobe_opcode_t *)&auprobe->insn,
+                               false /* is_register */);
+}
+
+static int __arch_uprobe_optimize(struct arch_uprobe *auprobe,
+                                  struct mm_struct *mm, unsigned long vaddr)
+{
+    struct uprobe_trampoline *tramp;
+    struct vm_area_struct *vma;
+    bool new = false;
+    int  err;
+
+    vma = find_vma(mm, vaddr);
+    if (!vma)
+        return -EINVAL;
+
+    tramp = get_uprobe_trampoline(vaddr, &new);
+    if (!tramp)
+        return -EINVAL;
+
+    err = swbp_optimize(auprobe, vma, vaddr, tramp->vaddr);
+    if (WARN_ON_ONCE(err) && new)
+        destroy_uprobe_trampoline(tramp);
+    return err;
+}
+
+void arch_uprobe_optimize(struct arch_uprobe *auprobe, unsigned long vaddr)
+{
+    struct mm_struct *mm = current->mm;
+    u32 insn;
+
+    if (!should_optimize(auprobe))
+        return;
+
+    mmap_write_lock(mm);
+
+    /* Recheck: another thread may have optimized while we waited for lock */
+    if (copy_from_vaddr(mm, vaddr, &insn, sizeof(u32)))
+        goto unlock;
+    if (!is_swbp_insn((uprobe_opcode_t *)&insn))
+        goto unlock;
+
+    if (__arch_uprobe_optimize(auprobe, mm, vaddr))
+        set_bit(ARCH_UPROBE_FLAG_OPTIMIZE_FAIL, &auprobe->flags);
+
+unlock:
+    mmap_write_unlock(mm);
+}
+
 #endif /* CONFIG_PPC64 */
 
 /**
@@ -300,7 +511,11 @@ int arch_uprobe_analyze_insn(struct arch_uprobe *auprobe,
 		pr_info_ratelimited("Cannot register a uprobe on instructions that can't be single stepped\n");
 		return -ENOTSUPP;
 	}
-
+#ifdef CONFIG_PPC64
+	/* Flag 4-byte NOP probes as eligible for bl optimization */
+	if (can_optimize(auprobe, addr))
+		set_bit(ARCH_UPROBE_FLAG_CAN_OPTIMIZE, &auprobe->flags);
+#endif
 	return 0;
 }
 
