@@ -11,6 +11,7 @@
 #include <linux/ptrace.h>
 #include <linux/uprobes.h>
 #include <linux/uaccess.h>
+#include <linux/syscalls.h>
 #include <linux/kdebug.h>
 
 #include <asm/sstep.h>
@@ -140,6 +141,127 @@ void arch_uprobe_clear_state(struct mm_struct *mm)
 
     hlist_for_each_entry_safe(tramp, n, &state->head_tramps, node)
         destroy_uprobe_trampoline(tramp);
+}
+
+asm (
+    ".pushsection .rodata\n"
+    ".balign " __stringify(PAGE_SIZE) "\n"
+    "uprobe_trampoline_entry:\n"
+    /* Allocate frame; stdu writes old r1 to 0(new r1) as back chain */
+    "stdu  1, -" __stringify(UPROBE_TRAMP_FRAME_SIZE) "(1)\n"
+    /* Save LR (=probe_addr+4 written by bl at probe site) */
+    "mflr  0\n"
+    "std   0, " __stringify(UPROBE_TRAMP_LR_OFFSET) "(1)\n"
+    /* Save CR; sc clobbers CR0 */
+    "mfcr  0\n"
+    "std   0, " __stringify(UPROBE_TRAMP_CR_OFFSET) "(1)\n"
+    /* Save r3-r12; sc clobbers these; values equal probe-site originals
+     * because std only reads registers */
+    "std   3,  24(1)\n"
+    "std   4,  32(1)\n"
+    "std   5,  40(1)\n"
+    "std   6,  48(1)\n"
+    "std   7,  56(1)\n"
+    "std   8,  64(1)\n"
+    "std   9,  72(1)\n"
+    "std  10,  80(1)\n"
+    "std  11,  88(1)\n"
+    "std  12,  96(1)\n"
+    "li    0, " __stringify(__NR_uprobe) "\n"
+    "sc\n"
+    /* Restore r3-r12; handler may have updated them in the frame */
+    "ld    3,  24(1)\n"
+    "ld    4,  32(1)\n"
+    "ld    5,  40(1)\n"
+    "ld    6,  48(1)\n"
+    "ld    7,  56(1)\n"
+    "ld    8,  64(1)\n"
+    "ld    9,  72(1)\n"
+    "ld   10,  80(1)\n"
+    "ld   11,  88(1)\n"
+    "ld   12,  96(1)\n"
+    "ld    0, " __stringify(UPROBE_TRAMP_CR_OFFSET) "(1)\n"
+    "mtcr  0\n"
+    "ld    0, " __stringify(UPROBE_TRAMP_LR_OFFSET) "(1)\n"
+    "addi  1, 1, " __stringify(UPROBE_TRAMP_FRAME_SIZE) "\n"
+    "mtlr  0\n"
+    "blr\n"
+    ".balign " __stringify(PAGE_SIZE) "\n"
+    ".popsection\n"
+);
+
+extern u8 uprobe_trampoline_entry[];
+
+static int __init arch_uprobes_init(void)
+{
+    tramp_mapping_pages[0] = virt_to_page(uprobe_trampoline_entry);
+    return 0;
+}
+late_initcall(arch_uprobes_init);
+
+static bool __in_uprobe_trampoline(unsigned long ip)
+{
+    struct vm_area_struct *vma = vma_lookup(current->mm, ip);
+
+    return vma && vma_is_special_mapping(vma, &tramp_mapping);
+}
+
+static bool in_uprobe_trampoline(unsigned long ip)
+{
+    struct mm_struct *mm = current->mm;
+    bool found;
+
+    mmap_read_lock(mm);
+    found = __in_uprobe_trampoline(ip);
+    mmap_read_unlock(mm);
+    return found;
+}
+
+SYSCALL_DEFINE0(uprobe)
+{
+    struct pt_regs *regs      = task_pt_regs(current);
+    unsigned long   tramp_nip = regs->nip;
+    unsigned long   tramp_r1  = regs->gpr[1];
+    unsigned long   probe_addr;
+    int err = 0, i;
+
+    /* Reject calls from outside kernel-installed trampoline VMAs */
+    if (!in_uprobe_trampoline(tramp_nip))
+        goto sigill;
+
+    /*
+     * bl stored probe_addr+4 in LR; trampoline's mflr copied it to r0
+     * leaving LR intact, so regs->link still holds probe_addr+4.
+     */
+    probe_addr = regs->link - 4;
+
+    /* Present probe-site register view to consumers */
+    regs->nip    = probe_addr;
+    regs->gpr[1] = tramp_r1 + UPROBE_TRAMP_FRAME_SIZE;
+
+    handle_syscall_uprobe(regs, probe_addr);
+
+    /*
+     * Write back consumer-modified gpr[3..12] into the trampoline frame;
+     * the trampoline's ld instructions restore them to user registers.
+     */
+    for (i = 0; i < 10; i++) {
+        err |= put_user(regs->gpr[3 + i],
+                        (unsigned long __user *)
+                        (tramp_r1 + UPROBE_TRAMP_GPR3_OFFSET + i * 8));
+    }
+    if (err)
+        goto sigill;
+
+    /* Restore trampoline context so sc return lands back in trampoline */
+    regs->gpr[1] = tramp_r1;
+    regs->nip    = tramp_nip;
+
+    return 0;
+
+sigill:
+    force_sig(SIGILL);
+    return -1;
 }
 
 #endif /* CONFIG_PPC64 */
